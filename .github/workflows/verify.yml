@@ -1,0 +1,90 @@
+name: Verify fix
+on: push
+permissions:
+  contents: read
+jobs:
+  backend:
+    name: Backend lint and tests (their test-backend.yml)
+    uses: ./.github/workflows/test-backend.yml
+  counts:
+    name: Statement counts before and after
+    runs-on: ubuntu-latest
+    env:
+      UV_FROZEN: "1"
+      PRODUCTION: "false"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-tools
+        with:
+          tools: python uv
+      - run: sudo apt-get update && sudo apt-get install -y libsasl2-dev libldap2-dev libssl-dev
+      - run: uv sync --group dev
+      - name: After (the fix)
+        run: |
+          cat > tests/unit_tests/repository_tests/test_verify_counts.py <<'PY'
+          # Verification only (not part of the fix): statement counts of create_many
+          # and of seeding the en-US foods into a new group.
+          from mealie.repos.seed.seeders import IngredientFoodsSeeder
+          from mealie.schema.recipe.recipe_ingredient import IngredientFoodAliasCreate, IngredientFoodSave
+          from tests.unit_tests.repository_tests.test_nested_loading import count_statements
+          from tests.utils.factories import random_string
+          from tests.utils.fixture_schemas import TestUser
+
+
+          def test_print_counts(unique_user: TestUser):
+              repos = unique_user.repos
+              counts = {}
+              for n in (2, 8, 50):
+                  items = [
+                      IngredientFoodSave(name=random_string(), group_id=unique_user.group_id)
+                      for _ in range(n)
+                  ]
+                  counts[f"create_many({n} foods)"] = count_statements(
+                      unique_user, lambda items=items: repos.ingredient_foods.create_many(items)
+                  )
+              print(f"\nVERIFYCOUNTS {counts}")
+
+
+          def test_print_seed_counts(unique_user: TestUser):
+              repos = unique_user.repos
+              seeder = IngredientFoodsSeeder(repos)
+              statements = count_statements(unique_user, lambda: seeder.seed("en-US"))
+              foods = repos.ingredient_foods.page_all(__import__("mealie.schema.response.pagination", fromlist=["x"]).PaginationQuery(page=1, per_page=-1)).total
+              print(f"\nVERIFYSEED statements={statements} foods={foods}")
+
+
+          def test_print_statements(unique_user: TestUser):
+              import sqlalchemy as sa
+
+              repos = unique_user.repos
+              statements: list[str] = []
+
+              def record(conn, cursor, statement, parameters, context, executemany):
+                  statements.append(("MANY " if executemany else "") + " ".join(statement.split())[:200])
+
+              items = [
+                  IngredientFoodSave(
+                      name=random_string(), group_id=unique_user.group_id
+                  )
+                  for _ in range(4)
+              ]
+              repos.session.expire_all()
+              engine = repos.session.get_bind()
+              sa.event.listen(engine, "before_cursor_execute", record)
+              try:
+                  repos.ingredient_foods.create_many(items)
+              finally:
+                  sa.event.remove(engine, "before_cursor_execute", record)
+              print("\nVERIFYSTATEMENTS\n" + "\n".join(statements))
+          PY
+          uv run pytest tests/unit_tests/repository_tests/test_verify_counts.py tests/unit_tests/repository_tests/test_nested_loading.py -s -q -p no:randomly
+      - name: Before (upstream repository_generic.py)
+        run: |
+          git checkout 2c6745a54f3f782b4f996f14947da8aa47ac7089 -- mealie/repos/repository_generic.py
+          uv run pytest tests/unit_tests/repository_tests/test_verify_counts.py -s -q -p no:randomly
+          if uv run pytest tests/unit_tests/repository_tests/test_nested_loading.py -q -k create_many; then
+            echo "::error::the new test passes without the fix"; exit 1
+          fi
+          echo "the new test fails without the fix, as expected"
